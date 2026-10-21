@@ -719,6 +719,8 @@ def _norm_num(s):
 
 def postprocess_result(result, pdf_texts):
     """Perbaiki hasil AI dengan fallback dari teks PDF langsung."""
+    if isinstance(result, list):
+        result = result[0] if result else {}
     info = result.get("info", {})
     jenis_api = info.get("jenis_api", "")
     dist = result.get("rencana_distribusi") or {}
