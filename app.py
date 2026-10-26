@@ -234,15 +234,18 @@ def load_from_sheets():
 # PDF EXTRACTION
 # ============================================================
 def extract_pdf_text(uploaded_file, max_chars=150000, max_pages=500):
-    """Extract text from uploaded PDF with memory and page limits."""
+    """Extract text from uploaded PDF with memory and page limits.
+    Returns (text, pages, raw_bytes_or_none).
+    raw_bytes is kept when text extraction yields very little content (image-based PDF).
+    """
     parts = []
     total_pages = 0
     char_count = 0
+    raw_bytes = None
     try:
         file_bytes = uploaded_file.read()
+        raw_bytes = file_bytes  # keep for potential vision fallback
         buf = io.BytesIO(file_bytes)
-        del file_bytes
-        gc.collect()
 
         with pdfplumber.open(buf) as pdf:
             total_pages = len(pdf.pages)
@@ -285,7 +288,15 @@ def extract_pdf_text(uploaded_file, max_chars=150000, max_pages=500):
         gc.collect()
     except Exception as e:
         parts = [f"[Error membaca PDF: {e}]"]
-    return "".join(parts), total_pages
+
+    text = "".join(parts)
+    # If text is very short (< 100 chars per page), PDF is likely image-based
+    # Keep raw_bytes so we can send it as inline data to Gemini vision
+    avg_chars_per_page = len(text.strip()) / max(total_pages, 1)
+    if avg_chars_per_page >= 50:
+        raw_bytes = None  # text extraction worked fine, no need for raw bytes
+        gc.collect()
+    return text, total_pages, raw_bytes
 
 
 # ============================================================
@@ -527,7 +538,10 @@ def build_user_prompt(pdf_texts):
         prompt += f"{'='*60}\n"
         prompt += f"DOKUMEN: {item['name']} ({item['pages']} halaman)\n"
         prompt += f"{'='*60}\n"
-        prompt += item["text"] + "\n\n"
+        if "raw_bytes" in item and item["raw_bytes"]:
+            prompt += "[PDF ini berupa scan/gambar — teks tidak bisa diekstrak. Baca langsung dari file PDF yang dilampirkan di atas.]\n\n"
+        else:
+            prompt += item["text"] + "\n\n"
     prompt += """Identifikasi mana PI dan mana Pertek, lalu cocokkan seluruh data. Output JSON saja.
 
 PERINGATAN PI PERUBAHAN: Jika ini PI Perubahan, dokumen PI punya kolom SEMULA (lama) dan MENJADI (baru).
@@ -540,11 +554,22 @@ PERINGATAN PI PERUBAHAN: Jika ini PI Perubahan, dokumen PI punya kolom SEMULA (l
 # ============================================================
 # CALL GEMINI API
 # ============================================================
-def call_gemini(api_key, model, system_prompt, user_prompt):
+def call_gemini(api_key, model, system_prompt, user_prompt, pdf_parts=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    parts = []
+    # Add inline PDF data for image-based PDFs (Gemini vision)
+    if pdf_parts:
+        for pp in pdf_parts:
+            parts.append({
+                "inlineData": {
+                    "mimeType": "application/pdf",
+                    "data": pp["data"],
+                }
+            })
+    parts.append({"text": user_prompt})
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
+        "contents": [{"parts": parts}],
         "generationConfig": {
             "temperature": 0.1,
             "maxOutputTokens": 65536,
@@ -557,15 +582,35 @@ def call_gemini(api_key, model, system_prompt, user_prompt):
 
 def analyze_documents(api_key, pdf_texts):
     user_prompt = build_user_prompt(pdf_texts)
-    models = ["gemini-3.1-flash-lite"]
+
+    # Build inline PDF parts for image-based PDFs
+    pdf_parts = []
+    has_image_pdf = False
+    for item in pdf_texts:
+        if "raw_bytes" in item and item["raw_bytes"]:
+            import base64
+            pdf_parts.append({
+                "data": base64.b64encode(item["raw_bytes"]).decode("utf-8"),
+                "name": item["name"],
+            })
+            has_image_pdf = True
+
+    # Use a vision-capable model if we have image-based PDFs
+    if has_image_pdf:
+        models = ["gemini-2.5-flash"]
+    else:
+        models = ["gemini-3.1-flash-lite"]
     last_error = ""
     progress = st.empty()
 
     for model_idx, model in enumerate(models):
         for attempt in range(3):
             try:
-                progress.info(f"🔄 Mencoba {model} (percobaan {attempt + 1}/3)...")
-                response = call_gemini(api_key, model, SYSTEM_PROMPT, user_prompt)
+                if has_image_pdf:
+                    progress.info(f"🔄 PDF berupa scan/gambar — menggunakan {model} vision (percobaan {attempt + 1}/3)...")
+                else:
+                    progress.info(f"🔄 Mencoba {model} (percobaan {attempt + 1}/3)...")
+                response = call_gemini(api_key, model, SYSTEM_PROMPT, user_prompt, pdf_parts=pdf_parts if has_image_pdf else None)
             except requests.exceptions.Timeout:
                 last_error = "Request timeout. Server terlalu lama merespon."
                 if attempt < 2:
@@ -1575,10 +1620,13 @@ with tab_analisis:
         total_chars_used = 0
         for f in uploaded_files:
             remaining = max(30000, MAX_TOTAL_CHARS - total_chars_used)
-            txt, pages = extract_pdf_text(f, max_chars=remaining)
+            txt, pages, raw_bytes = extract_pdf_text(f, max_chars=remaining)
             total_pages_all += pages
             total_chars_used += len(txt)
-            pdf_texts.append({"name": f.name, "text": txt, "pages": pages})
+            entry = {"name": f.name, "text": txt, "pages": pages}
+            if raw_bytes is not None:
+                entry["raw_bytes"] = raw_bytes
+            pdf_texts.append(entry)
 
         file_names = ", ".join([f"{p['name']} ({p['pages']}pg)" for p in pdf_texts])
         st.markdown(f'<div class="file-count">💐 {len(uploaded_files)} archivos subidos ({total_pages_all} páginas): {file_names}</div>', unsafe_allow_html=True)
