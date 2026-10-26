@@ -597,7 +597,7 @@ def analyze_documents(api_key, pdf_texts):
 
     # Use a vision-capable model if we have image-based PDFs
     if has_image_pdf:
-        models = ["gemini-2.5-flash"]
+        models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     else:
         models = ["gemini-3.1-flash-lite"]
     last_error = ""
@@ -661,8 +661,12 @@ def analyze_documents(api_key, pdf_texts):
                 raise ValueError(f"API Key tidak valid atau saldo habis. {err_msg}")
 
             if response.status_code in (400, 404):
-                # Model tidak ditemukan, skip ke model berikutnya
-                progress.warning(f"⚠️ Model {model} tidak tersedia, mencoba model lain...")
+                try:
+                    err_msg = response.json().get("error", {}).get("message", "")
+                except Exception:
+                    err_msg = response.text[:300]
+                last_error = f"Error {response.status_code}: {err_msg}"
+                progress.warning(f"⚠️ Model {model}: {err_msg[:100]}. Mencoba model lain...")
                 time.sleep(1)
                 break
 
