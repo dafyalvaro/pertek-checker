@@ -562,20 +562,23 @@ def call_gemini(api_key, model, system_prompt, user_prompt, pdf_parts=None):
         for pp in pdf_parts:
             parts.append({
                 "inlineData": {
-                    "mimeType": "application/pdf",
+                    "mimeType": "image/png",
                     "data": pp["data"],
                 }
             })
     parts.append({"text": user_prompt})
+    gen_config = {
+        "temperature": 0.1,
+        "maxOutputTokens": 65536,
+        "responseMimeType": "application/json",
+    }
+    # thinkingConfig only supported by certain models
+    if "3.1" in model or "2.5" in model:
+        gen_config["thinkingConfig"] = {"thinkingBudget": 0}
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 65536,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingBudget": 0},
-        }
+        "generationConfig": gen_config,
     }
     return requests.post(url, json=payload, timeout=240)
 
@@ -583,21 +586,35 @@ def call_gemini(api_key, model, system_prompt, user_prompt, pdf_parts=None):
 def analyze_documents(api_key, pdf_texts):
     user_prompt = build_user_prompt(pdf_texts)
 
-    # Build inline PDF parts for image-based PDFs
+    # Build inline image parts for image-based (scanned) PDFs
+    # Gemini inlineData doesn't support application/pdf, so we render pages to PNG
     pdf_parts = []
     has_image_pdf = False
     for item in pdf_texts:
         if "raw_bytes" in item and item["raw_bytes"]:
             import base64
-            pdf_parts.append({
-                "data": base64.b64encode(item["raw_bytes"]).decode("utf-8"),
-                "name": item["name"],
-            })
-            has_image_pdf = True
+            import pypdfium2 as pdfium
+            try:
+                pdf_doc = pdfium.PdfDocument(item["raw_bytes"])
+                for page_idx in range(min(len(pdf_doc), 20)):  # max 20 pages
+                    page = pdf_doc[page_idx]
+                    bitmap = page.render(scale=2)  # 2x for readability
+                    pil_image = bitmap.to_pil()
+                    buf = io.BytesIO()
+                    pil_image.save(buf, format="PNG", optimize=True)
+                    pdf_parts.append({
+                        "data": base64.b64encode(buf.getvalue()).decode("utf-8"),
+                        "name": f"{item['name']}_p{page_idx+1}",
+                    })
+                    buf.close()
+                pdf_doc.close()
+                has_image_pdf = True
+            except Exception as e:
+                st.warning(f"⚠️ Gagal render {item['name']} ke gambar: {e}")
 
     # Use a vision-capable model if we have image-based PDFs
     if has_image_pdf:
-        models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     else:
         models = ["gemini-3.1-flash-lite"]
     last_error = ""
