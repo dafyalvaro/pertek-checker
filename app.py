@@ -132,12 +132,34 @@ def check_password():
 # ============================================================
 # API KEY MANAGEMENT
 # ============================================================
-def load_api_key():
+def load_api_keys():
+    """Load all available API keys (primary + backups)."""
+    keys = []
+    # Primary key
     try:
-        return st.secrets["GEMINI_API_KEY"]
+        primary = st.secrets["GEMINI_API_KEY"]
+        if primary:
+            keys.append(primary)
     except Exception:
         pass
-    return st.session_state.get("saved_api_key", "")
+    # Backup keys: GEMINI_API_KEY_2, GEMINI_API_KEY_3, etc.
+    for i in range(2, 6):
+        try:
+            k = st.secrets[f"GEMINI_API_KEY_{i}"]
+            if k:
+                keys.append(k)
+        except Exception:
+            pass
+    # Manual key from session
+    manual = st.session_state.get("saved_api_key", "")
+    if manual and manual not in keys:
+        keys.append(manual)
+    return keys
+
+
+def load_api_key():
+    keys = load_api_keys()
+    return keys[0] if keys else ""
 
 
 # ============================================================
@@ -561,89 +583,120 @@ def analyze_documents(api_key, pdf_texts):
     last_error = ""
     progress = st.empty()
 
-    for model_idx, model in enumerate(models):
-        for attempt in range(3):
-            try:
-                progress.info(f"🔄 Mencoba {model} (percobaan {attempt + 1}/3)...")
-                response = call_gemini(api_key, model, SYSTEM_PROMPT, user_prompt)
-            except requests.exceptions.Timeout:
-                last_error = "Request timeout. Server terlalu lama merespon."
-                if attempt < 2:
-                    wait = (attempt + 1) * 8
-                    progress.warning(f"⏳ Timeout, menunggu {wait} detik sebelum coba lagi...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    break
-            except requests.exceptions.ConnectionError:
-                last_error = "Tidak bisa terhubung ke server Gemini."
-                if attempt < 2:
-                    wait = (attempt + 1) * 8
-                    progress.warning(f"⏳ Koneksi gagal, menunggu {wait} detik...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    break
+    # Get all available API keys for fallback
+    all_keys = load_api_keys()
+    if api_key and api_key not in all_keys:
+        all_keys.insert(0, api_key)
+    if not all_keys:
+        all_keys = [api_key]
 
-            if response.status_code == 429:
-                last_error = "Rate limit tercapai (terlalu banyak request)."
-                if attempt < 2:
-                    wait = (attempt + 1) * 20
-                    progress.warning(f"⏳ Rate limit, menunggu {wait} detik...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    break
+    for key_idx, current_key in enumerate(all_keys):
+        key_label = f"Key {key_idx + 1}/{len(all_keys)}"
 
-            if response.status_code in (500, 502, 503):
-                last_error = f"Server Gemini error (kode {response.status_code})."
-                if attempt < 2:
-                    wait = (attempt + 1) * 10
-                    progress.warning(f"⏳ Server error {response.status_code}, menunggu {wait} detik...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    # Move to next model
-                    progress.warning(f"⚠️ {model} gagal, mencoba model lain...")
-                    time.sleep(2)
-                    break
-
-            if response.status_code in (401, 403):
+        for model_idx, model in enumerate(models):
+            for attempt in range(3):
                 try:
-                    err_msg = response.json().get("error", {}).get("message", "")
-                except Exception:
-                    err_msg = ""
-                raise ValueError(f"API Key tidak valid atau saldo habis. {err_msg}")
+                    progress.info(f"🔄 Mencoba {model} ({key_label}, percobaan {attempt + 1}/3)...")
+                    response = call_gemini(current_key, model, SYSTEM_PROMPT, user_prompt)
+                except requests.exceptions.Timeout:
+                    last_error = "Request timeout. Server terlalu lama merespon."
+                    if attempt < 2:
+                        wait = (attempt + 1) * 8
+                        progress.warning(f"⏳ Timeout, menunggu {wait} detik sebelum coba lagi...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        break
+                except requests.exceptions.ConnectionError:
+                    last_error = "Tidak bisa terhubung ke server Gemini."
+                    if attempt < 2:
+                        wait = (attempt + 1) * 8
+                        progress.warning(f"⏳ Koneksi gagal, menunggu {wait} detik...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        break
 
-            if response.status_code in (400, 404):
-                # Model tidak ditemukan, skip ke model berikutnya
-                progress.warning(f"⚠️ Model {model} tidak tersedia, mencoba model lain...")
-                time.sleep(1)
-                break
+                if response.status_code == 429:
+                    last_error = "Rate limit tercapai (terlalu banyak request)."
+                    if attempt < 2:
+                        wait = (attempt + 1) * 20
+                        progress.warning(f"⏳ Rate limit, menunggu {wait} detik...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        break
 
-            if response.status_code != 200:
-                try:
-                    err_msg = response.json().get("error", {}).get("message", "")
-                except Exception:
-                    err_msg = response.text[:200]
-                last_error = f"Error {response.status_code}: {err_msg}"
-                break
-            data = response.json()
-            candidate = data["candidates"][0]
+                if response.status_code == 402:
+                    # Kredit habis — langsung pindah ke key berikutnya, jangan retry
+                    try:
+                        err_msg = response.json().get("error", {}).get("message", "")
+                    except Exception:
+                        err_msg = ""
+                    last_error = f"Kredit API habis ({key_label}). {err_msg}"
+                    if key_idx < len(all_keys) - 1:
+                        progress.warning(f"⚠️ Kredit {key_label} habis, mencoba key cadangan...")
+                        time.sleep(1)
+                    break  # break attempt loop, go to next key
 
-            if candidate.get("finishReason") == "MAX_TOKENS":
-                raise ValueError("Response terpotong. Coba upload lebih sedikit file.")
+                if response.status_code in (500, 502, 503):
+                    last_error = f"Server Gemini error (kode {response.status_code})."
+                    if attempt < 2:
+                        wait = (attempt + 1) * 10
+                        progress.warning(f"⏳ Server error {response.status_code}, menunggu {wait} detik...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        progress.warning(f"⚠️ {model} gagal, mencoba model lain...")
+                        time.sleep(2)
+                        break
 
-            response_text = candidate["content"]["parts"][0]["text"].strip()
-            if response_text.startswith("```"):
-                lines = response_text.split("\n")
-                lines = [l for l in lines if not l.strip().startswith("```")]
-                response_text = "\n".join(lines)
+                if response.status_code in (401, 403):
+                    try:
+                        err_msg = response.json().get("error", {}).get("message", "")
+                    except Exception:
+                        err_msg = ""
+                    # Kalau ada key lain, coba key berikutnya
+                    if key_idx < len(all_keys) - 1:
+                        last_error = f"API Key tidak valid ({key_label}). {err_msg}"
+                        progress.warning(f"⚠️ {key_label} tidak valid, mencoba key cadangan...")
+                        time.sleep(1)
+                        break  # go to next key
+                    raise ValueError(f"API Key tidak valid atau saldo habis. {err_msg}")
 
-            progress.empty()
-            return json.loads(response_text)
+                if response.status_code in (400, 404):
+                    progress.warning(f"⚠️ Model {model} tidak tersedia, mencoba model lain...")
+                    time.sleep(1)
+                    break
+
+                if response.status_code != 200:
+                    try:
+                        err_msg = response.json().get("error", {}).get("message", "")
+                    except Exception:
+                        err_msg = response.text[:200]
+                    last_error = f"Error {response.status_code}: {err_msg}"
+                    break
+                data = response.json()
+                candidate = data["candidates"][0]
+
+                if candidate.get("finishReason") == "MAX_TOKENS":
+                    raise ValueError("Response terpotong. Coba upload lebih sedikit file.")
+
+                response_text = candidate["content"]["parts"][0]["text"].strip()
+                if response_text.startswith("```"):
+                    lines = response_text.split("\n")
+                    lines = [l for l in lines if not l.strip().startswith("```")]
+                    response_text = "\n".join(lines)
+
+                progress.empty()
+                return json.loads(response_text)
+            else:
+                continue  # attempt loop exhausted, try next model
+            break  # broke out of attempt loop (402/401/etc), skip to next key
 
     progress.empty()
+    if "Kredit API habis" in last_error:
+        raise ValueError(f"Semua API key kredit habis. Silakan top up di https://aistudio.google.com atau tambahkan key cadangan (GEMINI_API_KEY_2) di Streamlit Secrets.")
     raise ValueError(f"Gagal setelah beberapa percobaan. {last_error} Coba lagi dalam 1-2 menit.")
 
 
