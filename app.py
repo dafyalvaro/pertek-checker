@@ -1436,15 +1436,6 @@ with tab_analisis:
                 st.text(item["text"][:8000] + ("..." if len(item["text"]) > 8000 else ""))
                 st.divider()
 
-        # Estimasi biaya
-        total_chars = sum(len(p["text"]) for p in pdf_texts)
-        est_tokens = total_chars // 3  # ~3 chars per token
-        est_input_cost = est_tokens * 0.15 / 1_000_000  # gemini-2.5-flash: $0.15/1M input
-        est_output_cost = 0.6 / 1_000_000 * 5000  # estimasi ~5k output tokens, $0.6/1M
-        est_total_usd = est_input_cost + est_output_cost
-        est_total_idr = est_total_usd * 16500
-        st.caption(f"💰 Estimación: ~{est_tokens:,} tokens | Costo: ~Rp {est_total_idr:,.0f}")
-
         st.markdown("")
         col1, col2 = st.columns([3, 1])
         with col1:
